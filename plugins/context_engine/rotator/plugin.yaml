@@ -1,0 +1,5 @@
+name: rotator
+version: 0.1.0
+description: "Mechanical session-rotation context engine (0 LLM calls per rotation). Fires at 70% of the context window, keeps a verbatim lean tail plus a mechanical anchor index, and lets the host's legacy rotating path fork a child session. Cron sessions are excluded."
+author: family-ops
+kind: context-engine
