@@ -1910,6 +1910,13 @@ DEFAULT_CONFIG = {
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.
         "reconcile_orphans": True,
+        # Spec-driven READY gate (family-ops multi-profile-spec-driven-workflow): when True, the
+        # dispatcher withholds NEW spec-driven protocol cards (title/body references the protocol,
+        # created after the LEGACY cutoff) that still miss assignee, a substantial body or
+        # acceptance criteria — the card stays READY and gets a spec_gate_blocked audit event.
+        # LEGACY and plain cards are never touched. Opt-in per home; family-ops sets it in its
+        # own config.yaml.
+        "spec_gate": False,
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.

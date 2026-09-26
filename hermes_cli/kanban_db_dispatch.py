@@ -8,6 +8,8 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import logging
 import os
 import re
 import signal
@@ -141,6 +143,10 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    skipped_spec_gate: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` withheld by the spec-driven READY gate
+    (``kanban.spec_gate``): new spec-driven protocol cards missing assignee,
+    body or acceptance criteria. LEGACY cards are never withheld."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -2228,6 +2234,167 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+# --- spec-driven READY gate (t_0ce3783c) -----------------------------------
+# 配套 family-ops/docs/multi-profile-spec-driven-workflow.md §3.2/§11: a card
+# without assignee/body/acceptance must not be dispatched by the machine
+# either — the human-facing validators (validate_spec_driven.py,
+# kanban_spec_gate.py) could only warn after the fact.
+#
+# Scope is deliberately narrow: ONLY "spec-driven protocol cards" created on
+# or after the LEGACY cutoff are gated. A card counts as spec-driven when its
+# title or body references the protocol — protocol marker / initiative id /
+# <PROJECT>-#### numbering, or a concrete spec reference. History (created
+# before the cutoff) is never blocked — LEGACY cards keep the exact pre-gate
+# dispatch behavior.
+#
+# 口径与 family-ops/tests/kanban_spec_gate.py、validate_spec_driven.py 逐字对齐
+# (t_81e401f4)：识别 = SPEC_CARD_RE（3hometech-spec-driven-v1 / spec-driven /
+# initiative_id / HUB-|FAMILY-|STOCK-|CONN-|SM- 四位编号）∪ SPEC_REF_RE
+# （spec.md / spec_version / specs/ 路径）。普通卡（无任何协议标记）仍不拦。
+SPEC_GATE_REQUIRED_RE = re.compile(
+    r"3hometech-spec-driven-v1|spec-driven|initiative[_ ]?id"
+    r"|(?:HUB|FAMILY|STOCK|CONN|SM)-\d{4}"
+    r"|spec[._-]?md|spec[._-]?version|specs/",
+    re.I)
+# 验收标识（规范§3.2：无验收标准的卡不得 READY）：验收 / acceptance / 独立编号
+# A1、A2、A10…。词边界约束（t_81e401f4）：旧式 A[0-9] 会把 "A2A" 里的 A2、
+# "X-A2B" 里的 A2 误判成验收编号（该拦不拦），改为
+# (?<![0-9A-Za-z_])A\d+(?![0-9A-Za-z_])——"A2A"/"X-A2B" 不匹配，
+# "A1"/"A10"/"（A2）" 匹配。与 family-ops 同一表达式。
+SPEC_GATE_ACCEPT_RE = re.compile(
+    r"验收|acceptance|(?<![0-9A-Za-z_])A\d+(?![0-9A-Za-z_])", re.I)
+
+# ≈ 2026-09-25 (t_1a2aef32 creation moment, the spec-driven rollout cutover).
+SPEC_GATE_LEGACY_CUTOFF = 1790344565
+_SPEC_GATE_MIN_BODY = 30
+_spec_gate_log = logging.getLogger("kanban.spec_gate")
+
+
+def spec_gate_enabled(kanban_cfg: Optional[dict] = None) -> bool:
+    """``kanban.spec_gate`` (default False — opt-in per home)."""
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            return False
+    return bool((kanban_cfg or {}).get("spec_gate", False))
+
+
+def spec_gate_violations(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[list[str]]:
+    """READY-constraint violations for a NEW spec-driven card, else None.
+
+    Returns None when the card is out of scope: not on the ready lane, not
+    spec-driven (no protocol reference), or created before the cutoff
+    (LEGACY — warn-only territory, never machine-blocked here).
+    """
+    checked = _spec_gate_read(conn, task_id)
+    if checked is None:
+        return None
+    missing, _digest = checked
+    return missing or None
+
+
+def _spec_gate_card_digest(title: str, body: str, assignee: str) -> str:
+    """Fingerprint of the fields the verdict is computed from.
+
+    The next tick compares it against the value recorded on the last
+    ``spec_gate_blocked`` event: an unchanged digest means the card is
+    untouched (suppress the duplicate audit event), a changed one means the
+    operator edited the card (write a fresh event).
+    """
+    raw = "\x00".join((title or "", body or "", assignee or ""))
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
+
+
+def _spec_gate_read(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[tuple[list[str], str]]:
+    """``(missing fields, card digest)`` for an in-scope card, else None.
+
+    None = out of scope: not on the ready lane, not spec-driven, or created
+    before the LEGACY cutoff. `missing` is empty for a compliant card.
+    """
+    row = conn.execute(
+        "SELECT title, body, assignee, status, created_at FROM tasks "
+        "WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "ready":
+        return None
+    if int(row["created_at"] or 0) < SPEC_GATE_LEGACY_CUTOFF:
+        return None
+    title = row["title"] or ""
+    body = row["body"] or ""
+    assignee = row["assignee"] or ""
+    if not SPEC_GATE_REQUIRED_RE.search(f"{title}\n{body}"):
+        # Not a spec-driven protocol card — plain cards stay ungated.
+        return None
+    missing: list[str] = []
+    if not assignee:
+        missing.append("assignee")
+    if len(body.strip()) < _SPEC_GATE_MIN_BODY:
+        missing.append("body")
+    if not SPEC_GATE_ACCEPT_RE.search(body):
+        missing.append("acceptance")
+    return missing, _spec_gate_card_digest(title, body, assignee)
+
+
+def _spec_gate_record_block(
+    conn: sqlite3.Connection, task_id: str, reason: str, digest: str, lane: str,
+) -> None:
+    """Append the audit event unless the last one already says the same thing.
+
+    t_81e401f4: a withheld card is re-checked on EVERY tick, so an
+    unconditional append grew the event log with byte-identical rows forever.
+    Suppress the write while the most recent ``spec_gate_blocked`` event
+    carries the same reason AND the card fields are unchanged (card not
+    repaired since); a changed reason — or an edited card — writes a new
+    event. Must run inside the caller's write txn.
+    """
+    last = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'spec_gate_blocked' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    payload = _kb._json_or(last["payload"], {}) if last is not None else {}
+    if isinstance(payload, dict) and payload.get("reason") == reason \
+            and payload.get("card_digest") == digest:
+        return
+    _kb._append_event(conn, task_id, "spec_gate_blocked",
+                      {"reason": reason, "lane": lane, "card_digest": digest})
+
+
+def _apply_spec_gate(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    result: "DispatchResult",
+    *,
+    lane: str,
+    dry_run: bool,
+) -> bool:
+    """Drop the row when a new spec-driven card violates READY constraints.
+
+    Returns True when the row was withheld (caller must ``continue``). The
+    card itself is NOT touched — status stays ``ready`` and the only trace is
+    the (deduplicated) audit event; the operator completes the fields (body /
+    assignee / acceptance) and the next tick dispatches it.
+    """
+    checked = _spec_gate_read(conn, row["id"])
+    if checked is None or not checked[0]:
+        return False
+    missing, digest = checked
+    reason = "spec_gate:" + ",".join(missing)
+    result.skipped_spec_gate.append((row["id"], reason))
+    if not dry_run:
+        with contextlib.suppress(Exception):
+            with _kb.write_txn(conn):
+                _spec_gate_record_block(conn, row["id"], reason, digest, lane)
+    _spec_gate_log.info("spec gate withheld %s (%s)", row["id"], reason)
+    return True
+
+
 def _any_spawnable_review(
     conn: sqlite3.Connection,
     review_rows: list[sqlite3.Row],
@@ -2349,10 +2516,18 @@ def _dispatch_once_locked(
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
+    # spec-driven READY gate (kanban.spec_gate, t_0ce3783c): withhold NEW
+    # spec-driven protocol cards that still miss assignee/body/acceptance
+    # before any claim attempt. LEGACY cards (pre-cutoff) and plain cards
+    # pass through untouched.
+    spec_gate_on = spec_gate_enabled()
     spawned = 0
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        if spec_gate_on and _apply_spec_gate(conn, row, result,
+                                             lane="ready", dry_run=dry_run):
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
