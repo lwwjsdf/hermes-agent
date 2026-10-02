@@ -411,7 +411,7 @@ def _profile_alias(args):
     name = args.profile_name
     remove = getattr(args, "remove", False)
     custom_name = getattr(args, "alias_name", None)
-    if not profile_exists(name):
+    if not remove and not profile_exists(name):
         _die(f"Error: Profile '{name}' does not exist.")
     alias_name = custom_name or name
     try:

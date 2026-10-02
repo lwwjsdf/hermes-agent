@@ -1042,6 +1042,53 @@ class TestAliasCollision:
         mock_run.assert_not_called()
 
 
+class TestProfileAliasCommand:
+    """Tests for the profile alias command's orphan-wrapper behavior."""
+
+    def test_remove_orphan_named_alias(self, profile_env, monkeypatch, capsys):
+        monkeypatch.setattr("hermes_cli.profiles.shutil.which", lambda name: "/opt/hermes/bin/hermes")
+        from types import SimpleNamespace
+
+        from hermes_cli.profile_cmd import _profile_alias
+        from hermes_cli.profiles import _get_wrapper_dir, create_wrapper_script
+
+        wrapper = create_wrapper_script("gone")
+        _profile_alias(SimpleNamespace(profile_name="gone", remove=True, alias_name=None))
+
+        assert not wrapper.exists()
+        assert not (_get_wrapper_dir() / "gone").exists()
+        assert "✓ Removed alias 'gone'" in capsys.readouterr().out
+
+    def test_remove_custom_alias_for_missing_profile(self, profile_env, monkeypatch, capsys):
+        monkeypatch.setattr("hermes_cli.profiles.shutil.which", lambda name: "/opt/hermes/bin/hermes")
+        from types import SimpleNamespace
+
+        from hermes_cli.profile_cmd import _profile_alias
+        from hermes_cli.profiles import _get_wrapper_dir, create_wrapper_script
+
+        wrapper = create_wrapper_script("custom", target="gone")
+        _profile_alias(SimpleNamespace(profile_name="gone", remove=True, alias_name="custom"))
+
+        assert not wrapper.exists()
+        assert not (_get_wrapper_dir() / "custom").exists()
+        assert "✓ Removed alias 'custom'" in capsys.readouterr().out
+
+    def test_remove_alias_for_existing_profile(self, profile_env, monkeypatch, capsys):
+        monkeypatch.setattr("hermes_cli.profiles.shutil.which", lambda name: "/opt/hermes/bin/hermes")
+        from types import SimpleNamespace
+
+        from hermes_cli.profile_cmd import _profile_alias
+        from hermes_cli.profiles import _get_wrapper_dir, create_profile, create_wrapper_script
+
+        create_profile("coder", no_alias=True)
+        wrapper = create_wrapper_script("coder")
+        _profile_alias(SimpleNamespace(profile_name="coder", remove=True, alias_name=None))
+
+        assert not wrapper.exists()
+        assert not (_get_wrapper_dir() / "coder").exists()
+        assert "✓ Removed alias 'coder'" in capsys.readouterr().out
+
+
 # ===================================================================
 # TestWrapperScript
 # ===================================================================
