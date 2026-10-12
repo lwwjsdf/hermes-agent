@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -221,6 +222,71 @@ class TestWeixinChunkDelivery:
         adapter._base_url = "https://weixin.example.com"
         adapter._token_store.get = lambda account_id, chat_id: context_token
         return adapter
+
+    def _temporary_home_adapter(self, tmp_path, monkeypatch, context_token=None) -> WeixinAdapter:
+        monkeypatch.setattr(weixin, "get_hermes_home", lambda: str(tmp_path))
+        adapter = self._connected_adapter(context_token=context_token)
+        adapter._hermes_home = str(tmp_path)
+        return adapter
+
+    def test_not_ready_backoff_sequence_and_circuit_threshold(self):
+        assert [weixin._not_ready_backoff_seconds(n) for n in range(1, 6)] == [60, 120, 240, 480, 960]
+        assert weixin._not_ready_backoff_seconds(7) == 30 * 60
+
+    def test_not_ready_failure_backs_off_once_and_converges_alert(self, tmp_path, monkeypatch, caplog):
+        adapter = self._temporary_home_adapter(tmp_path, monkeypatch, context_token=None)
+        adapter._delivery_states.clear()
+        send_message_mock = AsyncMock(return_value={
+            "ret": weixin.RATE_LIMIT_ERRCODE, "errmsg": "prepare failed"})
+
+        with patch("gateway.platforms.weixin._send_message", send_message_mock), caplog.at_level(logging.WARNING):
+            first = asyncio.run(adapter.send("wxid_test123", "hello"))
+            assert adapter._not_ready_wait_remaining("wxid_test123") > 0
+            second = asyncio.run(adapter.send("wxid_test123", "hello"))
+            assert adapter._not_ready_wait_remaining("wxid_test123") > 0
+            for _ in range(3):
+                adapter._not_ready_state("wxid_test123")["next_retry"] = 0
+                failed = asyncio.run(adapter.send("wxid_test123", "hello"))
+                assert failed.success is False and "prepare failed" in (failed.error or "")
+            assert send_message_mock.await_count == 4
+            adapter._not_ready_state("wxid_test123")["next_retry"] = 0
+            fifth = asyncio.run(adapter.send("wxid_test123", "hello"))
+            sixth = asyncio.run(adapter.send("wxid_test123", "hello"))
+            warnings_before_circuit = [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        assert first.success is False and "prepare failed" in (first.error or "")
+        assert second.success is False and "backing off" in (second.error or "")
+        assert send_message_mock.await_count == 5
+        assert fifth.success is False and "prepare failed" in (fifth.error or "")
+        assert sixth.success is False and "circuit open" in (sixth.error or "")
+        assert send_message_mock.await_count == 5
+        assert len(warnings_before_circuit) == 1
+        assert "failure_count=1" in warnings_before_circuit[0].getMessage()
+
+        alert_path = tmp_path / "state" / "weixin_delivery_alerts.jsonl"
+        events = [json.loads(line) for line in alert_path.read_text().splitlines()]
+        assert len(events) == 1
+        assert events[0]["event"] == "weixin_delivery_session_not_ready"
+        assert events[0]["failure_count"] == 1
+        assert "prepare failed" in events[0]["last_error"]
+
+    def test_not_ready_recovery_writes_one_local_event(self, tmp_path, monkeypatch, caplog):
+        adapter = self._temporary_home_adapter(tmp_path, monkeypatch, context_token=None)
+        adapter._delivery_states.clear()
+        adapter._record_not_ready_failure("wxid_test123", "prepare failed")
+        send_message_mock = AsyncMock(return_value={"ret": 0})
+
+        with patch("gateway.platforms.weixin._send_message", send_message_mock), caplog.at_level(logging.INFO):
+            adapter._not_ready_state("wxid_test123")["next_retry"] = 0
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        alert_path = tmp_path / "state" / "weixin_delivery_alerts.jsonl"
+        events = [json.loads(line) for line in alert_path.read_text().splitlines()]
+        assert [event["event"] for event in events] == [
+            "weixin_delivery_session_not_ready", "weixin_delivery_recovered"]
+        assert events[-1]["failure_count"] == 1
+        assert any(record.levelno == logging.INFO and "recovered" in record.getMessage() for record in caplog.records)
 
 
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
