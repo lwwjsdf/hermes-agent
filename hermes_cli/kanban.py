@@ -1007,6 +1007,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
+    # Validate before `_commented` writes audit comments: a rejected marker
+    # must leave the card and its run history untouched.
+    kb.parse_scheduled_until(reason)
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""

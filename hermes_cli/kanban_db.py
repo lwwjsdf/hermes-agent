@@ -21,6 +21,7 @@ import subprocess
 import sys
 import logging
 import time
+from datetime import datetime, timezone
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +111,42 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+SCHEDULED_UNTIL_TOKEN = "SCHEDULED_UNTIL"
+SCHEDULED_UNTIL_EXPECTED = "SCHEDULED_UNTIL=<ISO8601 timestamp with explicit timezone, e.g. 2026-10-14T13:30:00+08:00 or ...Z>"
+_SCHEDULED_UNTIL_RE = re.compile(r"(?<![A-Za-z0-9_])SCHEDULED_UNTIL=([^\s]+)")
+
+
+def parse_scheduled_until(reason: Optional[str]) -> Optional[datetime]:
+    """Return the aware ``SCHEDULED_UNTIL`` value, or ``None`` when absent."""
+    text = reason or ""
+    matches = _SCHEDULED_UNTIL_RE.findall(text)
+    mentions = len(re.findall(r"(?<![A-Za-z0-9_])SCHEDULED_UNTIL\b", text))
+    actual = ", ".join(matches) if matches else text.strip() or "<empty>"
+    if mentions > 1 or len(matches) > 1:
+        raise ValueError(
+            f"scheduled wake marker must appear exactly once; expected {SCHEDULED_UNTIL_EXPECTED}; "
+            f"actual {actual!r}"
+        )
+    if mentions and not matches:
+        raise ValueError(
+            f"invalid scheduled wake marker; expected {SCHEDULED_UNTIL_EXPECTED}; actual {actual!r}"
+        )
+    if not matches:
+        return None
+    raw = matches[0]
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid scheduled wake timestamp; expected {SCHEDULED_UNTIL_EXPECTED}; actual {raw!r}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(
+            f"scheduled wake timestamp requires an explicit timezone; "
+            f"expected {SCHEDULED_UNTIL_EXPECTED}; actual {raw!r}"
+        )
+    return parsed
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -3649,48 +3686,43 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
+def _unblock_task_locked(
+    conn: sqlite3.Connection, task_id: str, *, now: int,
+    allowed_statuses: tuple[str, ...] = ("blocked", "scheduled"),
+) -> bool:
+    """Unblock inside an existing write transaction."""
+    status = _task_status(conn, task_id)
+    if status not in allowed_statuses:
+        return False
+    resume_status = _resume_status_from_events(conn, task_id) if status == "blocked" else "ready"
+    _reclaim_dangling_run(
+        conn, task_id, statuses=allowed_statuses, now=now,
+        note="invariant recovery on unblock",
+    )
+    landing_status = _landing_status_after_parents(conn, task_id)
+    new_status = "review" if landing_status == "ready" and resume_status == "review" else landing_status
+    placeholders = ", ".join("?" for _ in allowed_statuses)
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, current_run_id = NULL, "
+        "consecutive_failures = 0, last_failure_error = NULL "
+        f"WHERE id = ? AND status IN ({placeholders})",
+        (new_status, task_id, *allowed_statuses),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(
+        conn, task_id, "unblocked",
+        ({"status": new_status, "resume_status": resume_status}
+         if new_status != "ready" or resume_status != "ready" else None),
+    )
+    return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
-    now = int(time.time())
     with write_txn(conn):
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
-            else "ready"
-        )
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
-        )
-        # Re-gate on parent completion before restoring the source phase.
-        landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
-        return True
+        return _unblock_task_locked(conn, task_id, now=int(time.time()))
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3963,6 +3995,7 @@ def schedule_task(
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
+    parse_scheduled_until(reason)
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -3984,6 +4017,91 @@ def schedule_task(
         )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
         return True
+
+
+def _scheduled_source(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[int, Optional[str]]]:
+    event = conn.execute(
+        "SELECT id, run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'scheduled' ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if event is None:
+        return None
+    event_reason = _json_dict(event["payload"]).get("reason")
+    if event_reason and SCHEDULED_UNTIL_TOKEN in str(event_reason):
+        return int(event["id"]), str(event_reason)
+    run = None
+    if event["run_id"] is not None:
+        run = conn.execute(
+            "SELECT summary FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(event["run_id"]), task_id),
+        ).fetchone()
+    if run is None:
+        run = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id = ? "
+            "AND (status = 'scheduled' OR outcome = 'scheduled') ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    run_reason = run["summary"] if run else None
+    return int(event["id"]), (str(run_reason) if run_reason else event_reason)
+
+
+def _scheduled_wake_recorded(conn: sqlite3.Connection, task_id: str, source_event_id: int) -> bool:
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('scheduled_wake', 'scheduled_wake_missed', 'scheduled_wake_unparsable')",
+        (task_id,),
+    ).fetchall()
+    return any(
+        _json_dict(row["payload"]).get("source_event_id") == source_event_id
+        for row in rows
+    )
+
+
+def sweep_scheduled_tasks(
+    conn: sqlite3.Connection, *, now: Optional[datetime] = None, grace_seconds: int = 600,
+) -> int:
+    """Wake due cards; leave invalid historical markers parked with one durable alert."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("scheduled sweep 'now' requires an explicit timezone")
+    current = current.astimezone(timezone.utc)
+    grace = max(0, int(grace_seconds))
+    woke = 0
+    with write_txn(conn):
+        task_ids = [row["id"] for row in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'scheduled' ORDER BY id"
+        )]
+        for task_id in task_ids:
+            source = _scheduled_source(conn, task_id)
+            if source is None:
+                continue
+            source_event_id, reason = source
+            if _scheduled_wake_recorded(conn, task_id, source_event_id):
+                continue
+            try:
+                due = parse_scheduled_until(reason)
+            except ValueError as exc:
+                _append_event(conn, task_id, "scheduled_wake_unparsable", {
+                    "source_event_id": source_event_id, "reason": str(exc),
+                })
+                continue
+            if due is None:
+                continue
+            due_utc = due.astimezone(timezone.utc)
+            if current < due_utc:
+                continue
+            late_seconds = max(0, int((current - due_utc).total_seconds()))
+            if not _unblock_task_locked(
+                conn, task_id, now=int(current.timestamp()), allowed_statuses=("scheduled",),
+            ):
+                continue
+            kind = "scheduled_wake_missed" if late_seconds > grace else "scheduled_wake"
+            _append_event(conn, task_id, kind, {
+                "due": due.isoformat(), "late_seconds": late_seconds,
+                "source_event_id": source_event_id,
+            })
+            woke += 1
+    return woke
 
 
 # --- Worker context builder (what a spawned worker sees) ---
@@ -4501,6 +4619,7 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
+    DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS,
     DispatchResult,
     _clear_failure_counter,
     _defer_reclaim_for_live_worker,
