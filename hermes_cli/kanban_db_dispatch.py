@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
+DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS = 600
 
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -1877,6 +1878,17 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_scheduled_wake_grace_seconds() -> int:
+    """Read the non-negative scheduled wake grace, falling back safely."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "scheduled_wake_grace_seconds", DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS)
+        return max(0, int(raw))
+    except Exception:
+        return DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -1964,6 +1976,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    scheduled_wake_grace_seconds: int = DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1987,6 +2000,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            scheduled_wake_grace_seconds=scheduled_wake_grace_seconds,
         )
 
     try:
@@ -2339,6 +2353,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    scheduled_wake_grace_seconds: int = DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2346,6 +2361,8 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    if not dry_run:
+        _kb.sweep_scheduled_tasks(conn, grace_seconds=scheduled_wake_grace_seconds)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
@@ -3020,6 +3037,7 @@ def run_daemon(
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    scheduled_wake_grace_seconds=configured_scheduled_wake_grace_seconds(),
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

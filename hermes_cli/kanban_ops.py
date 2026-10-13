@@ -78,9 +78,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        scheduled_wake_grace_seconds = max(0, int(_kanban_cfg.get(
+            "scheduled_wake_grace_seconds", kbd.DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS
+        )))
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        scheduled_wake_grace_seconds = kbd.DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -90,6 +94,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            scheduled_wake_grace_seconds=scheduled_wake_grace_seconds,
         )
     if getattr(args, "json", False):
         _print_json({
