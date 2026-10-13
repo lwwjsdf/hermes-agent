@@ -42,6 +42,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    scheduled_wake_grace_seconds: int = 600
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -102,6 +103,17 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
+    raw_wake_grace = kanban_cfg.get(
+        "scheduled_wake_grace_seconds", kb.DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS)
+    try:
+        scheduled_wake_grace_seconds = max(0, int(raw_wake_grace))
+    except (TypeError, ValueError):
+        logger.warning(
+            "kanban dispatcher: invalid kanban.scheduled_wake_grace_seconds=%r; using default %d",
+            raw_wake_grace, kb.DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS,
+        )
+        scheduled_wake_grace_seconds = kb.DEFAULT_SCHEDULED_WAKE_GRACE_SECONDS
+
     return _DispatcherSettings(
         interval=interval,
         max_spawn=max_spawn,
@@ -115,6 +127,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        scheduled_wake_grace_seconds=scheduled_wake_grace_seconds,
     )
 
 
