@@ -54,6 +54,9 @@ EP_GET_CONFIG, EP_GET_UPLOAD_URL = "ilink/bot/getconfig", "ilink/bot/getuploadur
 EP_GET_BOT_QR, EP_GET_QR_STATUS = "ilink/bot/get_bot_qrcode", "ilink/bot/get_qrcode_status"
 LONG_POLL_TIMEOUT_MS, API_TIMEOUT_MS, CONFIG_TIMEOUT_MS, QR_TIMEOUT_MS = 35_000, 15_000, 10_000, 35_000
 MAX_CONSECUTIVE_FAILURES, RETRY_DELAY_SECONDS, BACKOFF_DELAY_SECONDS = 3, 2, 30
+SESSION_NOT_READY_BACKOFF_SECONDS = 60.0
+SESSION_NOT_READY_BACKOFF_CAP_SECONDS = 30 * 60.0
+SESSION_NOT_READY_CIRCUIT_FAILURES = 5
 SESSION_EXPIRED_ERRCODE, RATE_LIMIT_ERRCODE = -14, -2  # -2: iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
 MEDIA_IMAGE, MEDIA_VIDEO, MEDIA_FILE, MEDIA_VOICE = 1, 2, 3, 4  # getuploadurl media_type
@@ -86,6 +89,13 @@ def _session_not_ready_error(ret: Any, errcode: Any, errmsg: Any) -> RuntimeErro
     return RuntimeError(
         f"iLink sendmessage session not ready: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}"
         " — the user must send the bot a message first (or re-pair)")
+
+
+def _not_ready_backoff_seconds(failure_count: int) -> float:
+    """First retry waits a full minute; later waits double, capped at 30 minutes."""
+    return min(
+        SESSION_NOT_READY_BACKOFF_SECONDS * (2 ** max(0, failure_count - 1)),
+        SESSION_NOT_READY_BACKOFF_CAP_SECONDS)
 
 
 def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
@@ -719,6 +729,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._rate_limit_circuit_window_seconds = float(_extra_or_secret(extra, "rate_limit_circuit_window_seconds", "30.0"))
         self._rate_limit_circuit_open_seconds = float(_extra_or_secret(extra, "rate_limit_circuit_open_seconds", "30.0"))
         self._rate_limit_circuit_until, self._rate_limit_events = 0.0, []  # type: float, List[float]
+        self._delivery_state_path = Path(hermes_home) / "state" / "weixin_delivery_backoff.json"
+        self._delivery_states = self._load_delivery_states()
         self._dm_policy = _extra_or_secret(extra, "dm_policy", "pairing").lower()
         self._group_policy = _extra_or_secret(extra, "group_policy", "disabled").lower()
         # ``extra`` wins even when falsy (an explicit empty list disables the env allowlist).
@@ -733,6 +745,85 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if persisted:
             self._token = str(persisted.get("token") or "").strip()
             self._base_url = str(persisted.get("base_url") or self._base_url).strip().rstrip("/")
+
+    def _load_delivery_states(self) -> Dict[str, Dict[str, float]]:
+        """Load retry/circuit state so a gateway restart cannot bypass an open breaker."""
+        states = _read_json(self._delivery_state_path)
+        return states if isinstance(states, dict) else {}
+
+    @staticmethod
+    def _delivery_state_key(account_id: str, chat_id: str) -> str:
+        identity = f"{account_id}\0{chat_id}"
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def _save_delivery_states(self) -> None:
+        with contextlib.suppress(Exception):
+            self._delivery_state_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(self._delivery_state_path, self._delivery_states, mode=0o600)
+
+    def _not_ready_state(self, chat_id: str) -> Dict[str, float]:
+        key = self._delivery_state_key(self._account_id, chat_id)
+        state = self._delivery_states.setdefault(key, {"failure_count": 0.0, "next_retry": 0.0})
+        state["failure_count"] = float(state.get("failure_count") or 0)
+        state["next_retry"] = float(state.get("next_retry") or 0)
+        return state
+
+    def _not_ready_circuit_remaining(self, chat_id: str) -> float:
+        state = self._not_ready_state(chat_id)
+        if state["failure_count"] < SESSION_NOT_READY_CIRCUIT_FAILURES:
+            return 0.0
+        return max(0.0, state["next_retry"] - time.monotonic())
+
+    def _not_ready_wait_remaining(self, chat_id: str) -> float:
+        return max(0.0, self._not_ready_state(chat_id)["next_retry"] - time.monotonic())
+
+    def _append_delivery_alert(self, event: Dict[str, Any]) -> None:
+        """Best-effort local discovery record; never sends the alert externally."""
+        path = Path(self._hermes_home) / "state" / "weixin_delivery_alerts.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+        except Exception:
+            logger.debug("Failed to append weixin delivery alert", exc_info=True)
+
+    def _record_not_ready_failure(self, chat_id: str, error: str) -> float:
+        """Advance the exponential ladder once per real failure and create one converged alert."""
+        state = self._not_ready_state(chat_id)
+        state["failure_count"] += 1
+        delay = _not_ready_backoff_seconds(int(state["failure_count"]))
+        state["next_retry"] = time.monotonic() + delay
+        self._save_delivery_states()
+        chat_key = self._delivery_state_key(self._account_id, chat_id)
+        if state["failure_count"] == 1:
+            self._append_delivery_alert({
+                "event": "weixin_delivery_session_not_ready",
+                "key": chat_key,
+                "failure_count": 1,
+                "last_error": error,
+                "retry_delay_seconds": delay,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+            logger.warning(
+                "weixin delivery unavailable chat_key=%s failure_count=1 retry_in=%.0fs last_error=%s",
+                chat_key[:16], delay, error)
+        return delay
+
+    def _record_not_ready_recovery(self, chat_id: str) -> None:
+        state = self._not_ready_state(chat_id)
+        if state["failure_count"] <= 0:
+            return
+        chat_key = self._delivery_state_key(self._account_id, chat_id)
+        failure_count = int(state["failure_count"])
+        self._delivery_states.pop(self._delivery_state_key(self._account_id, chat_id), None)
+        self._save_delivery_states()
+        self._append_delivery_alert({
+            "event": "weixin_delivery_recovered",
+            "key": chat_key,
+            "failure_count": failure_count,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        logger.info("weixin delivery recovered chat_key=%s prior_failure_count=%d", chat_key[:16], failure_count)
 
     @staticmethod
     def _coerce_list(value: Any) -> List[str]:
@@ -993,6 +1084,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         if _is_stale_session_ret(ret, errcode, errmsg):
                             # break, not raise: a raise here is caught below and re-enters the retry ladder.
                             last_error = _session_not_ready_error(ret, errcode, errmsg)
+                            self._record_not_ready_failure(chat_id, str(last_error))
                             break
                         if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
                             raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
@@ -1006,7 +1098,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         if attempt >= self._send_chunk_retries:
                             break
                         attempt += 1
-                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                        wait = _not_ready_backoff_seconds(attempt)
                         logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
                         await asyncio.sleep(wait)
                         continue
@@ -1018,7 +1110,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     if attempt >= self._send_chunk_retries:
                         break
                     attempt += 1
-                    wait = self._send_chunk_retry_delay_seconds * attempt
+                    wait = _not_ready_backoff_seconds(attempt)
                     logger.warning("[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
                                    self.name, _safe_id(chat_id), attempt, self._send_chunk_retries + 1, wait, exc)
                     if wait > 0:
@@ -1029,6 +1121,13 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
+        wait_remaining = self._not_ready_wait_remaining(chat_id)
+        if wait_remaining > 0:
+            if self._not_ready_circuit_remaining(chat_id) > 0:
+                return SendResult(success=False, error=(
+                    f"iLink sendmessage session not ready; circuit open for {wait_remaining:.1f}s"))
+            return SendResult(success=False, error=(
+                f"iLink sendmessage session not ready; backing off for {wait_remaining:.1f}s"))
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
@@ -1053,6 +1152,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
+            self._record_not_ready_recovery(chat_id)
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
