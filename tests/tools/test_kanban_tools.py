@@ -712,6 +712,92 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
     assert create() == (("worktree", project_id) if target_scoped else ("scratch", None))
 
 
+def test_create_issue_duplicate_rejected(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        existing = kb.create_task(
+            conn, title="existing", body="Work lwwjsdf/family-ops#171",
+            assignee="peer", initial_status="running")
+        kb.claim_task(conn, existing)
+
+    out = kt._handle_create({
+        "title": "duplicate", "assignee": "peer",
+        "body": "Follow family-ops#171",
+    })
+    result = json.loads(out)
+    assert "error" in result
+    assert existing in result["error"]
+    assert "merger card" in result["error"]
+
+
+def test_create_issue_duplicate_with_existing_id_allowed(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        existing = kb.create_task(
+            conn, title="existing", body="Work hub#171", assignee="peer",
+            initial_status="blocked")
+
+    out = kt._handle_create({
+        "title": "merger", "assignee": "peer",
+        "body": f"并案到 {existing}；hub#171",
+    })
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["task_id"] != existing
+
+
+def test_create_without_issue_reference_allowed(worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "no issue", "assignee": "peer",
+        "body": "No issue reference here.",
+    }))
+    assert result["ok"] is True
+
+
+def test_create_issue_gate_fails_open(worker_env, monkeypatch, caplog):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    def unreadable(*args, **kwargs):
+        raise RuntimeError("board unavailable")
+
+    monkeypatch.setattr(kb, "list_tasks", unreadable)
+    with caplog.at_level("WARNING", logger="tools.kanban_tools"):
+        result = json.loads(kt._handle_create({
+            "title": "fail open", "assignee": "peer",
+            "body": "family-ops#171",
+        }))
+    assert result["ok"] is True
+    assert "could not read the board" in caplog.text
+
+
+def test_create_issue_gate_can_be_disabled(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli.config import save_config
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        existing = kb.create_task(
+            conn, title="existing", body="family-ops#171", assignee="peer")
+        kb.claim_task(conn, existing)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    save_config({"kanban": {"dedup_gate": False}})
+    result = json.loads(kt._handle_create({
+        "title": "duplicate", "assignee": "peer", "body": "family-ops#171",
+    }))
+    assert result["ok"] is True
+    assert result["task_id"] != existing
+
+
 def test_link_running_child_allows_owner_but_rejects_foreign(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
