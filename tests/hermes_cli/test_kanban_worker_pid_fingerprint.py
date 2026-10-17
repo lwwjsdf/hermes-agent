@@ -230,27 +230,67 @@ def test_dispatch_defers_live_previous_crash_then_gives_up_at_configured_limit(b
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot1|179221506358")
     Path(os.environ["HERMES_HOME"]).joinpath("config.yaml").write_text(
-        "kanban:\n  prev_worker_alive_defer_ticks: 2\n", encoding="utf-8"
+        "kanban:\n  prev_worker_alive_defer_ticks: 3\n  dispatch_interval_seconds: 3600\n",
+        encoding="utf-8",
     )
     tid = kb.create_task(board, title="retry", assignee="worker")
+    def arm_crashed_run():
+        with kb.write_txn(board):
+            board.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, "
+                "worker_pid=NULL, worker_started_at=NULL, "
+                "claim_lock=NULL, claim_expires=NULL WHERE id=?", (tid,))
+            board.execute(
+                "INSERT INTO task_runs(task_id, outcome, status, worker_pid, "
+                "worker_started_at, started_at, ended_at) "
+                "VALUES (?, 'crashed', 'crashed', ?, ?, ?, ?)",
+                (tid, os.getpid(), "boot1|179221506358", int(time.time()) - 10, int(time.time()) - 1),
+            )
+    arm_crashed_run()
+    spawned = []
+    spawn = lambda *_args, **_kwargs: (spawned.append(tid) or os.getpid())
+
+    for _ in range(3):
+        kbd.dispatch_once(board, spawn_fn=spawn)
+        assert spawned == []
+        defer_events = [e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive"]
+        assert len(defer_events) == 1
+        assert defer_events[0].payload["prev_pid"] == os.getpid()
+
     with kb.write_txn(board):
-        board.execute("UPDATE tasks SET status='ready', current_run_id=NULL, worker_pid=NULL, worker_started_at=NULL WHERE id=?", (tid,))
+        board.execute("UPDATE task_runs SET ended_at=? WHERE id=(SELECT max(id) FROM task_runs WHERE task_id=?)",
+                      (int(time.time()) - 5 * 3600, tid))
+    kbd.dispatch_once(board, spawn_fn=spawn)
+    assert spawned == [tid]
+
+    arm_crashed_run()
+    kbd.dispatch_once(board, spawn_fn=spawn)
+    assert spawned == [tid, tid]
+    assert len([e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive_gave_up"]) == 1
+
+
+def test_defer_dedupe_matches_prev_pid_exactly_not_as_substring(board, monkeypatch):
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot1|179221506358")
+    Path(os.environ["HERMES_HOME"]).joinpath("config.yaml").write_text(
+        "kanban:\n  prev_worker_alive_defer_ticks: 30\n  dispatch_interval_seconds: 3600\n",
+        encoding="utf-8",
+    )
+    tid = kb.create_task(board, title="retry", assignee="worker")
+    colliding_pid = os.getpid() * 10 + 7
+    with kb.write_txn(board):
         board.execute(
-            "INSERT INTO task_runs(task_id, outcome, status, worker_pid, worker_started_at, started_at, ended_at) "
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "worker_pid=NULL, worker_started_at=NULL WHERE id=?", (tid,))
+        board.execute(
+            "INSERT INTO task_runs(task_id, outcome, status, worker_pid, "
+            "worker_started_at, started_at, ended_at) "
             "VALUES (?, 'crashed', 'crashed', ?, ?, ?, ?)",
             (tid, os.getpid(), "boot1|179221506358", int(time.time()) - 10, int(time.time()) - 1),
         )
-    spawned = []
-    spawn = lambda *_args, **_kwargs: (spawned.append(tid) or os.getpid())
-    first = kbd.dispatch_once(board, spawn_fn=spawn)
-    assert spawned == []
-    assert len([e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive"]) == 1
-    Path(os.environ["HERMES_HOME"]).joinpath("config.yaml").write_text(
-        "kanban:\n  prev_worker_alive_defer_ticks: 0\n", encoding="utf-8"
-    )
-    second = kbd.dispatch_once(board, spawn_fn=spawn)
-    assert spawned == [tid]
-    assert len([e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive_gave_up"]) == 1
-    third = kbd.dispatch_once(board, spawn_fn=spawn)
-    assert len([e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive_gave_up"]) == 1
-    assert spawned == [tid]
+        kb._append_event(board, tid, "spawn_deferred_prev_worker_alive", {"prev_pid": colliding_pid})
+    kbd.dispatch_once(board, spawn_fn=lambda *_a, **_k: os.getpid())
+    events = [e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive"]
+    assert len(events) == 2
+    assert {e.payload["prev_pid"] for e in events} == {colliding_pid, os.getpid()}

@@ -950,45 +950,47 @@ _PREV_WORKER_ALIVE_DEFER_TICKS = 30
 
 
 def _prev_worker_alive_defer_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Defer one retry while the previous crashed run's worker is still alive.
+    """Defer retries while the previous crashed run's worker is still alive.
 
     Crash bookkeeping can race a worker's final DB write.  Re-spawning in that
-    window creates two writers; a bounded event count lets a genuinely wedged
-    process eventually yield to the normal retry path.
+    window creates two writers; the defer window (``prev_worker_alive_defer_ticks``
+    dispatch ticks) lets a genuinely wedged process eventually yield.  Defer and
+    give-up events are deduplicated per ``(task_id, prev_pid)`` so repeated ticks
+    cannot flood the event log.
     """
     run = conn.execute(
-        "SELECT worker_pid, worker_started_at FROM task_runs "
+        "SELECT worker_pid, worker_started_at, ended_at FROM task_runs "
         "WHERE task_id = ? AND outcome = 'crashed' ORDER BY id DESC LIMIT 1", (task_id,)
     ).fetchone()
     if run is None or not run["worker_pid"] or not _kb._pid_alive(run["worker_pid"]):
         return None
     if not _worker_alive(run["worker_pid"], run["worker_started_at"]):
         return None
-    limit = _PREV_WORKER_ALIVE_DEFER_TICKS
+    cfg = {}
     try:
         from hermes_cli.config import load_config
-        limit = int(((load_config().get("kanban") or {}).get("prev_worker_alive_defer_ticks", limit)))
+        cfg = load_config().get("kanban") or {}
     except Exception:
-        limit = _PREV_WORKER_ALIVE_DEFER_TICKS
-    count = conn.execute(
-        "SELECT count(*) FROM task_events WHERE task_id = ? "
-        "AND kind = 'spawn_deferred_prev_worker_alive'", (task_id,)
-    ).fetchone()[0]
-    if count >= max(0, limit):
-        prev_pid = int(run["worker_pid"])
-        already_gave_up = conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id = ? "
-            "AND kind = 'spawn_deferred_prev_worker_alive_gave_up' "
-            "AND payload LIKE ? LIMIT 1",
-            (task_id, f'%\"prev_pid\": {prev_pid}%'),
-        ).fetchone()
-        if already_gave_up:
-            return None
-        with _kb.write_txn(conn):
-            _kb._append_event(conn, task_id, "spawn_deferred_prev_worker_alive_gave_up",
-                              {"prev_pid": prev_pid, "defer_ticks": count})
+        cfg = {}
+    limit = int(cfg.get("prev_worker_alive_defer_ticks", _PREV_WORKER_ALIVE_DEFER_TICKS))
+    interval = int(cfg.get("dispatch_interval_seconds", 60))
+    prev_pid = int(run["worker_pid"])
+    already_gave_up = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'spawn_deferred_prev_worker_alive_gave_up' "
+        "AND json_extract(payload, '$.prev_pid') = ? LIMIT 1",
+        (task_id, prev_pid),
+    ).fetchone()
+    if already_gave_up:
         return None
-    return "spawn_deferred_prev_worker_alive"
+    defer_window_seconds = max(0, limit) * max(0, interval)
+    ended_at = int(run["ended_at"] or 0)
+    if int(time.time()) - ended_at < defer_window_seconds:
+        return "spawn_deferred_prev_worker_alive"
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "spawn_deferred_prev_worker_alive_gave_up",
+                          {"prev_pid": prev_pid, "defer_ticks": limit})
+    return None
 
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
@@ -2181,8 +2183,8 @@ def _dispatch_lane_task(
                 prev_pid = int(prev_run["worker_pid"]) if prev_run and prev_run["worker_pid"] else None
                 duplicate = prev_pid is not None and conn.execute(
                     "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
-                    "AND payload LIKE ? LIMIT 1",
-                    (task_id, defer_reason, f'%\"prev_pid\": {prev_pid}%'),
+                    "AND json_extract(payload, '$.prev_pid') = ? LIMIT 1",
+                    (task_id, defer_reason, prev_pid),
                 ).fetchone()
                 if not duplicate:
                     _kb._append_event(conn, task_id, defer_reason, {"reason": defer_reason, "prev_pid": prev_pid})
