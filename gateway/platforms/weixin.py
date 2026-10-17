@@ -121,6 +121,22 @@ def _safe_id(value: Optional[str], keep: int = 8) -> str:
     return raw[:keep] if raw else "?"
 
 
+_SERVER_RECEIPT_FIELDS = (
+    "message_id", "msg_id", "new_msg_id", "server_msg_id", "server_message_id", "id", "seq")
+
+
+def _server_message_receipt(response: Any) -> Optional[str]:
+    if not isinstance(response, dict):
+        return None
+    for field in _SERVER_RECEIPT_FIELDS:
+        value = response.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float)) and value != 0:
+            return str(value)
+    return None
+
+
 def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
     pad_len = block_size - (len(data) % block_size)
     return data + bytes([pad_len] * pad_len)
@@ -966,7 +982,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._rate_limit_circuit_until = max(self._rate_limit_circuit_until, time.monotonic() + self._rate_limit_circuit_open_seconds)
         return self._rate_limit_cooldown_remaining() > 0
 
-    async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
+    async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> Dict[str, Any]:
         """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
         or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
         tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
@@ -1012,7 +1028,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         continue
                     self._rate_limit_events.clear()
                     self._rate_limit_circuit_until = 0.0
-                    return
+                    return resp
                 except Exception as exc:
                     last_error = exc
                     if attempt >= self._send_chunk_retries:
@@ -1030,7 +1046,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
-        last_message_id: Optional[str] = None
+        message_receipts: List[str] = []
         # Extract MEDIA: tags and bare local file paths before text delivery, under the routed
         # profile's scope: Docker MEDIA translation infers the sandbox from the active profile (#109024).
         with self._media_delivery_scope(self.build_source(chat_id=chat_id)):
@@ -1049,14 +1065,18 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                await self._send_text_chunk(chat_id=chat_id, chunk=chunk, context_token=context_token, client_id=client_id)
-                last_message_id = client_id
+                response = await self._send_text_chunk(chat_id=chat_id, chunk=chunk, context_token=context_token, client_id=client_id)
+                receipt_id = _server_message_receipt(response)
+                if receipt_id is None:
+                    raise RuntimeError("iLink sendmessage response missing server receipt")
+                message_receipts.append(receipt_id)
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
-            return SendResult(success=True, message_id=last_message_id)
+            return SendResult(success=True, message_id=message_receipts[-1], continuation_message_ids=tuple(message_receipts[:-1]), raw_response=message_receipts)
         except Exception as exc:
-            logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            reason = str(exc) or type(exc).__name__
+            logger.error("[%s] delivery FAILED to=%s: %s", self.name, _safe_id(chat_id), reason)
+            return SendResult(success=False, error=f"delivery FAILED: {reason}")
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
         """Return a valid typing ticket, refreshing via getConfig once the 600s TTL evicts it —

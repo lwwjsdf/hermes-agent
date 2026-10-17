@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -234,7 +235,7 @@ class TestWeixinChunkDelivery:
             calls["count"] += 1
             if calls["count"] == 2:
                 raise RuntimeError("temporary iLink failure")
-
+            return {"ret": 0, "message_id": f"server-{calls['count']}"}
         send_message_mock.side_effect = flaky_send
 
         # Use double newlines so _pack_markdown_blocks splits into 3 blocks
@@ -285,7 +286,7 @@ class TestWeixinChunkDelivery:
         adapter._rate_limit_circuit_threshold = 1
         adapter._token_store._cache[adapter._token_store._key(adapter._account_id, "wxid_test123")] = "ctx-token"
         prepare_failed = {error_field: weixin.RATE_LIMIT_ERRCODE, "errmsg": "prepare failed"}
-        send_message_mock.side_effect = [prepare_failed, {"ret": 0}]
+        send_message_mock.side_effect = [prepare_failed, {"ret": 0, "message_id": "server-after-retry"}]
 
         result = asyncio.run(adapter.send("wxid_test123", "hello"))
 
@@ -320,12 +321,65 @@ class TestWeixinChunkDelivery:
         not a failed attempt, so it must not eat the (only) retry slot and fall out of the loop (#112709)."""
         adapter = self._connected_adapter()
         adapter._send_chunk_retries = 0
-        send_message_mock.side_effect = [{"ret": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "session expired"}, {"ret": 0}]
+        send_message_mock.side_effect = [
+            {"ret": weixin.SESSION_EXPIRED_ERRCODE, "errmsg": "session expired"},
+            {"ret": 0, "message_id": "server-tokenless"}]
 
         result = asyncio.run(adapter.send("wxid_test123", "hello"))
 
         assert result.success is True
         assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == ["ctx-token", None]
+
+
+class TestWeixinServerReceipt:
+    def _connected_adapter(self) -> WeixinAdapter:
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        return adapter
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_accepts_server_receipt(self, send_message_mock, caplog):
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = {"ret": 0, "message_id": "server-123"}
+
+        with caplog.at_level(logging.ERROR):
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert result.message_id == "server-123"
+        assert "delivery FAILED" not in caplog.text
+
+    @pytest.mark.parametrize("response", [None, {"ret": 0}])
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_rejects_missing_server_receipt(self, send_message_mock, caplog, response):
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = response
+
+        with caplog.at_level(logging.ERROR):
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert "delivery FAILED" in result.error
+        assert "server receipt" in result.error
+        assert "delivery FAILED" in caplog.text
+
+    @pytest.mark.parametrize("field", ["ret", "errcode"])
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_rejects_platform_error_code(self, send_message_mock, caplog, field):
+        adapter = self._connected_adapter()
+        send_message_mock.return_value = {field: 500, "errmsg": "platform rejected"}
+
+        with caplog.at_level(logging.ERROR):
+            result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert "delivery FAILED" in result.error
+        assert "platform rejected" in result.error
+        assert "delivery FAILED" in caplog.text
 
     @patch.object(weixin, "_send_items", new_callable=AsyncMock)
     @patch.object(weixin, "_upload_ciphertext", new=AsyncMock(return_value="enc-q"))
