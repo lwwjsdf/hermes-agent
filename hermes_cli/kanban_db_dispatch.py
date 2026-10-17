@@ -975,9 +975,18 @@ def _prev_worker_alive_defer_reason(conn: sqlite3.Connection, task_id: str) -> O
         "AND kind = 'spawn_deferred_prev_worker_alive'", (task_id,)
     ).fetchone()[0]
     if count >= max(0, limit):
+        prev_pid = int(run["worker_pid"])
+        already_gave_up = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'spawn_deferred_prev_worker_alive_gave_up' "
+            "AND payload LIKE ? LIMIT 1",
+            (task_id, f'%\"prev_pid\": {prev_pid}%'),
+        ).fetchone()
+        if already_gave_up:
+            return None
         with _kb.write_txn(conn):
             _kb._append_event(conn, task_id, "spawn_deferred_prev_worker_alive_gave_up",
-                              {"prev_pid": int(run["worker_pid"]), "defer_ticks": count})
+                              {"prev_pid": prev_pid, "defer_ticks": count})
         return None
     return "spawn_deferred_prev_worker_alive"
 
@@ -2165,7 +2174,18 @@ def _dispatch_lane_task(
         result.respawn_guarded.append((task_id, defer_reason))
         if not dry_run:
             with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, defer_reason, {"reason": defer_reason})
+                prev_run = conn.execute(
+                    "SELECT worker_pid FROM task_runs WHERE task_id = ? "
+                    "AND outcome = 'crashed' ORDER BY id DESC LIMIT 1", (task_id,)
+                ).fetchone()
+                prev_pid = int(prev_run["worker_pid"]) if prev_run and prev_run["worker_pid"] else None
+                duplicate = prev_pid is not None and conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                    "AND payload LIKE ? LIMIT 1",
+                    (task_id, defer_reason, f'%\"prev_pid\": {prev_pid}%'),
+                ).fetchone()
+                if not duplicate:
+                    _kb._append_event(conn, task_id, defer_reason, {"reason": defer_reason, "prev_pid": prev_pid})
         return False
 
     def _count_spawn(name: str) -> None:

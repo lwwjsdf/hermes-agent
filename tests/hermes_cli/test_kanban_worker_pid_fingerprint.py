@@ -8,6 +8,7 @@ must require the spawn-time start fingerprint to match, never bare PID existence
 import os
 import signal
 import time
+from pathlib import Path
 
 import pytest
 
@@ -165,6 +166,43 @@ def test_reclaim_sweep_uses_tolerant_fingerprint(board, monkeypatch, delta, expe
     assert killed == []
 
 
+def test_pid_fingerprint_drift_matrix_and_unreadable_claim(monkeypatch):
+    monkeypatch.setattr(kbd._kb, "_pid_alive", lambda _pid: True)
+    recorded = "|179221506358"
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "|179221506161")
+    assert kbd._pid_recycled(1, recorded) is False
+    assert kbd._worker_alive(1, recorded) is True
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "|179221506658")
+    assert kbd._pid_recycled(1, recorded) is True
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot2|179221506358")
+    assert kbd._pid_recycled(1, "boot1|179221506358") is True
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
+    assert kbd._pid_recycled(1, recorded) is True
+    assert kbd._worker_alive(1, recorded) is True
+
+
+def test_reclaim_dead_worker_sweep_locks_drift_semantics(board, monkeypatch):
+    recorded = "|179221506358"
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "|179221506161")
+    kept = _claimed_running(board, pid=os.getpid(), started_at=recorded, max_runtime=3600)
+    sweep = kbd._reclaim_dead_workers(board)
+    assert sweep.crashed == []
+    assert kb.get_task(board, kept).status == "running"
+    assert not [e for e in kb.list_events(board, kept) if e.kind == "crashed"]
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status='ready', worker_pid=NULL, worker_started_at=NULL WHERE id=?", (kept,))
+
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "|179221506658")
+    foreign = _claimed_running(board, pid=os.getpid(), started_at=recorded, max_runtime=3600)
+    sweep = kbd._reclaim_dead_workers(board)
+    assert sweep.crashed == [foreign]
+    event = next(e for e in kb.list_events(board, foreign) if e.kind == "crashed")
+    assert event.payload["pid_alive_at_reclaim"] is True
+    assert event.payload["fingerprint_recorded"] == recorded
+    assert event.payload["fingerprint_current"] == "|179221506658"
+
+
 def test_reclaim_sweep_keeps_claim_when_fingerprint_unreadable(board, monkeypatch):
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
@@ -188,12 +226,12 @@ def test_reclaim_sweep_rejects_epoch_mismatch_and_records_observation(board, mon
 
 
 def test_dispatch_defers_live_previous_crash_then_gives_up_at_configured_limit(board, monkeypatch):
-    import hermes_cli.config as config
-
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot1|179221506358")
-    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"prev_worker_alive_defer_ticks": 2}})
+    Path(os.environ["HERMES_HOME"]).joinpath("config.yaml").write_text(
+        "kanban:\n  prev_worker_alive_defer_ticks: 2\n", encoding="utf-8"
+    )
     tid = kb.create_task(board, title="retry", assignee="worker")
     with kb.write_txn(board):
         board.execute("UPDATE tasks SET status='ready', current_run_id=NULL, worker_pid=NULL, worker_started_at=NULL WHERE id=?", (tid,))
@@ -206,10 +244,13 @@ def test_dispatch_defers_live_previous_crash_then_gives_up_at_configured_limit(b
     spawn = lambda *_args, **_kwargs: (spawned.append(tid) or os.getpid())
     first = kbd.dispatch_once(board, spawn_fn=spawn)
     assert spawned == []
-    assert any(e.kind == "spawn_deferred_prev_worker_alive" for e in kb.list_events(board, tid))
+    assert len([e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive"]) == 1
+    Path(os.environ["HERMES_HOME"]).joinpath("config.yaml").write_text(
+        "kanban:\n  prev_worker_alive_defer_ticks: 0\n", encoding="utf-8"
+    )
     second = kbd.dispatch_once(board, spawn_fn=spawn)
-    assert spawned == []
-    assert not any(e.kind == "spawn_deferred_prev_worker_alive_gave_up" for e in kb.list_events(board, tid))
+    assert spawned == [tid]
+    assert len([e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive_gave_up"]) == 1
     third = kbd.dispatch_once(board, spawn_fn=spawn)
-    assert any(e.kind == "spawn_deferred_prev_worker_alive_gave_up" for e in kb.list_events(board, tid))
+    assert len([e for e in kb.list_events(board, tid) if e.kind == "spawn_deferred_prev_worker_alive_gave_up"]) == 1
     assert spawned == [tid]
