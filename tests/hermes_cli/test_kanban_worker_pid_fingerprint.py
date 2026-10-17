@@ -149,3 +149,67 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+@pytest.mark.parametrize("delta, expected_running", [(-197, True), (300, False)])
+def test_reclaim_sweep_uses_tolerant_fingerprint(board, monkeypatch, delta, expected_running):
+    """Regression for family-ops#198: exercise the stale-claim sweep, not its helper."""
+    recorded = "boot1|179221506358"
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: f"boot1|{179221506358 + delta}")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    tid = _claimed_running(board, pid=os.getpid(), started_at=recorded)
+    killed = []
+    reclaimed = kb.release_stale_claims(board, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    assert reclaimed == (0 if expected_running else 1)
+    assert (kb.get_task(board, tid).status == "running") is expected_running
+    assert killed == []
+
+
+def test_reclaim_sweep_keeps_claim_when_fingerprint_unreadable(board, monkeypatch):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    tid = _claimed_running(board, pid=os.getpid(), started_at="boot1|179221506358")
+    killed = []
+    assert kb.release_stale_claims(board, signal_fn=lambda pid, sig: killed.append((pid, sig))) == 0
+    assert kb.get_task(board, tid).status == "running"
+    assert killed == []
+
+
+def test_reclaim_sweep_rejects_epoch_mismatch_and_records_observation(board, monkeypatch):
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot2|179221506358")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    tid = _claimed_running(board, pid=os.getpid(), started_at="boot1|179221506358")
+    sweep = kbd._reclaim_dead_workers(board)
+    assert sweep.crashed == [tid]
+    event = next(e for e in kb.list_events(board, tid) if e.kind == "crashed")
+    assert event.payload["pid_alive_at_reclaim"] is True
+    assert event.payload["fingerprint_recorded"] == "boot1|179221506358"
+    assert event.payload["fingerprint_current"] == "boot2|179221506358"
+
+
+def test_dispatch_defers_live_previous_crash_then_gives_up_at_configured_limit(board, monkeypatch):
+    import hermes_cli.config as config
+
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _name: True)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot1|179221506358")
+    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"prev_worker_alive_defer_ticks": 2}})
+    tid = kb.create_task(board, title="retry", assignee="worker")
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status='ready', current_run_id=NULL, worker_pid=NULL, worker_started_at=NULL WHERE id=?", (tid,))
+        board.execute(
+            "INSERT INTO task_runs(task_id, outcome, status, worker_pid, worker_started_at, started_at, ended_at) "
+            "VALUES (?, 'crashed', 'crashed', ?, ?, ?, ?)",
+            (tid, os.getpid(), "boot1|179221506358", int(time.time()) - 10, int(time.time()) - 1),
+        )
+    spawned = []
+    spawn = lambda *_args, **_kwargs: (spawned.append(tid) or os.getpid())
+    first = kbd.dispatch_once(board, spawn_fn=spawn)
+    assert spawned == []
+    assert any(e.kind == "spawn_deferred_prev_worker_alive" for e in kb.list_events(board, tid))
+    second = kbd.dispatch_once(board, spawn_fn=spawn)
+    assert spawned == []
+    assert not any(e.kind == "spawn_deferred_prev_worker_alive_gave_up" for e in kb.list_events(board, tid))
+    third = kbd.dispatch_once(board, spawn_fn=spawn)
+    assert any(e.kind == "spawn_deferred_prev_worker_alive_gave_up" for e in kb.list_events(board, tid))
+    assert spawned == [tid]
