@@ -3133,6 +3133,8 @@ def _save_compose_deliver(
                 # on the failure path) honor the job's failure_deliver override (NS-788).
                 for_failure=not d.success,
             )
+            if d.delivery_error:
+                logger.error("Job '%s': delivery FAILED: %s", job["id"], d.delivery_error)
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise
