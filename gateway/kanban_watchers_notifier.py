@@ -65,6 +65,19 @@ def diagnostic_event(ev) -> bool:
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
 
+# Passive-reply platforms (weixin iLink) reject bot-initiated sends while the
+# chat's reply window is closed ("session not ready", ret=-2). That is a
+# TRANSIENT platform condition, not a dead subscription: retrying every 5s
+# burns quota and (pre-fix) dropped healthy subs in bulk during the window.
+# Detection: match the transport error text; response: a per-PLATFORM breaker.
+import time as _time
+_PASSIVE_WINDOW_PAT = re.compile(
+    r"session not ready|must send the bot a message first|ret=-2|reply window", re.I)
+PASSIVE_BREAKER_TRIP = 3          # consecutive passive-window failures to trip
+PASSIVE_BREAKER_COOLDOWN = 1800.0  # seconds; inbound user message clears it sooner
+_platform_passive_fails: dict = {}
+_platform_passive_until: dict = {}
+
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
 
@@ -294,6 +307,10 @@ class _Collector:
         if platform not in self.active_platforms:
             logger.debug("kanban notifier: subscription for %s on %s skipped; adapter not connected",
                          sub.get("task_id"), platform or "<missing>")
+            return None
+        # Platform-wide passive-window cooldown: skip claiming entirely while the
+        # breaker is open so closed-window sends never spin (cleared on success).
+        if _time.monotonic() < _platform_passive_until.get(platform, 0.0):
             return None
         from gateway.config import Platform
         if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
@@ -540,9 +557,31 @@ class _KanbanNotification:
 
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
+        # A successful delivery proves the platform's reply window is open again.
+        _platform_passive_fails.pop(self.platform_str, None)
+        _platform_passive_until.pop(self.platform_str, None)
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
         """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
+        # Passive-window breaker: a closed reply window (weixin iLink ret=-2) is
+        # transient — never count it toward the drop counter; trip a platform-wide
+        # cooldown after 3 consecutive hits so we stop spinning against the window.
+        if _PASSIVE_WINDOW_PAT.search(str(exc) or ""):
+            fails = _platform_passive_fails.get(self.platform_str, 0) + 1
+            _platform_passive_fails[self.platform_str] = fails
+            if fails >= PASSIVE_BREAKER_TRIP:
+                _platform_passive_until[self.platform_str] = _time.monotonic() + PASSIVE_BREAKER_COOLDOWN
+                logger.warning(
+                    "kanban notifier: passive reply window closed on %s after %d failed sends; "
+                    "pausing pushes for %.0fs (inbound message resumes)", self.platform_str, fails, PASSIVE_BREAKER_COOLDOWN)
+            else:
+                logger.warning("kanban notifier: passive reply window closed on %s (%d/%d); will retry later",
+                               self.platform_str, fails, PASSIVE_BREAKER_TRIP)
+            await self.rewind()
+            return
+        # Any successful send elsewhere on this platform resets its passive counter.
+        _platform_passive_fails.pop(self.platform_str, None)
+        _platform_passive_until.pop(self.platform_str, None)
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
