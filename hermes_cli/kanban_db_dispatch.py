@@ -391,6 +391,16 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
+    # An unreadable fingerprint is uncertainty, not evidence that the worker died.
+    # Keep the claim until the PID disappears; the signal path below remains
+    # fail-closed through _pid_recycled.
+    if started_at is not None and started_at != UNVERIFIED_WORKER_FINGERPRINT:
+        if isinstance(started_at, str) and "|" in started_at and _process_fingerprint(int(pid)) is None:
+            return True
+        if not isinstance(started_at, str):
+            from gateway.status import get_process_start_time
+            if get_process_start_time(int(pid)) is None:
+                return True
     return not _pid_recycled(pid, started_at)
 
 
@@ -404,13 +414,24 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
-    from gateway.status import _start_times_agree, get_process_start_time
+        current = _process_fingerprint(int(pid))
+        if current is None:
+            return True
+        try:
+            recorded_epoch, recorded_start = started_at.split("|", 1)
+            current_epoch, current_start = current.split("|", 1)
+            if recorded_epoch != current_epoch:
+                return True
+            from gateway.status import start_time_fingerprints_match
+            return not start_time_fingerprints_match(recorded_start, current_start)
+        except (TypeError, ValueError):
+            return True
+    from gateway.status import start_time_fingerprints_match, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
         return True
     try:
-        return not _start_times_agree(current, started_at)
+        return not start_time_fingerprints_match(started_at, current)
     except (TypeError, ValueError):
         return True
 
@@ -925,6 +946,51 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
 # Closed runs to walk when counting the streak; it trips at a handful anyway.
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
+_PREV_WORKER_ALIVE_DEFER_TICKS = 30
+
+
+def _prev_worker_alive_defer_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Defer retries while the previous crashed run's worker is still alive.
+
+    Crash bookkeeping can race a worker's final DB write.  Re-spawning in that
+    window creates two writers; the defer window (``prev_worker_alive_defer_ticks``
+    dispatch ticks) lets a genuinely wedged process eventually yield.  Defer and
+    give-up events are deduplicated per ``(task_id, prev_pid)`` so repeated ticks
+    cannot flood the event log.
+    """
+    run = conn.execute(
+        "SELECT worker_pid, worker_started_at, ended_at FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'crashed' ORDER BY id DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    if run is None or not run["worker_pid"] or not _kb._pid_alive(run["worker_pid"]):
+        return None
+    if not _worker_alive(run["worker_pid"], run["worker_started_at"]):
+        return None
+    cfg = {}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config().get("kanban") or {}
+    except Exception:
+        cfg = {}
+    limit = int(cfg.get("prev_worker_alive_defer_ticks", _PREV_WORKER_ALIVE_DEFER_TICKS))
+    interval = int(cfg.get("dispatch_interval_seconds", 60))
+    prev_pid = int(run["worker_pid"])
+    already_gave_up = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'spawn_deferred_prev_worker_alive_gave_up' "
+        "AND json_extract(payload, '$.prev_pid') = ? LIMIT 1",
+        (task_id, prev_pid),
+    ).fetchone()
+    if already_gave_up:
+        return None
+    defer_window_seconds = max(0, limit) * max(0, interval)
+    ended_at = int(run["ended_at"] or 0)
+    if int(time.time()) - ended_at < defer_window_seconds:
+        return "spawn_deferred_prev_worker_alive"
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "spawn_deferred_prev_worker_alive_gave_up",
+                          {"prev_pid": prev_pid, "defer_ticks": limit})
+    return None
 
 
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
@@ -1168,6 +1234,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            recorded_fingerprint = _kb._row_get(row, "worker_started_at")
+            current_fingerprint = _process_fingerprint(pid)
+            dead.event_payload.update({
+                "pid_alive_at_reclaim": bool(_kb._pid_alive(pid)),
+                "fingerprint_recorded": recorded_fingerprint,
+                "fingerprint_current": current_fingerprint,
+            })
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -2100,6 +2173,24 @@ def _dispatch_lane_task(
                 if (last is None or last["kind"] != "respawn_guarded"
                         or last["payload"] != _kb._json_or_null({"reason": guard_reason})):
                     _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+        return False
+    defer_reason = _prev_worker_alive_defer_reason(conn, task_id)
+    if defer_reason is not None:
+        result.respawn_guarded.append((task_id, defer_reason))
+        if not dry_run:
+            with _kb.write_txn(conn):
+                prev_run = conn.execute(
+                    "SELECT worker_pid FROM task_runs WHERE task_id = ? "
+                    "AND outcome = 'crashed' ORDER BY id DESC LIMIT 1", (task_id,)
+                ).fetchone()
+                prev_pid = int(prev_run["worker_pid"]) if prev_run and prev_run["worker_pid"] else None
+                duplicate = prev_pid is not None and conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                    "AND json_extract(payload, '$.prev_pid') = ? LIMIT 1",
+                    (task_id, defer_reason, prev_pid),
+                ).fetchone()
+                if not duplicate:
+                    _kb._append_event(conn, task_id, defer_reason, {"reason": defer_reason, "prev_pid": prev_pid})
         return False
 
     def _count_spawn(name: str) -> None:

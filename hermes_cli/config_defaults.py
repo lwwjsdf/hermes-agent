@@ -1948,6 +1948,9 @@ DEFAULT_CONFIG = {
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.
         "reconcile_orphans": True,
+        # Retry a crashed task only after its retained worker PID has yielded;
+        # prevents two live workers from writing the same controlled task.
+        "prev_worker_alive_defer_ticks": 30,
         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
