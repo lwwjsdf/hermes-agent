@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -418,7 +419,54 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     children = kb.child_ids(conn, task.id)
     return {
         **_fields(task, _TASK_SUMMARY_FIELDS), "parents": parents, "children": children,
-        "parent_count": len(parents), "child_count": len(children)}
+                   "parent_count": len(parents), "child_count": len(children)}
+
+
+_ISSUE_REF_RE = re.compile(r"\b(?:(family-ops|hub))?#(\d+)\b", re.IGNORECASE)
+
+
+def _issue_refs(*values: Any) -> set[tuple[Optional[str], int]]:
+    refs: set[tuple[Optional[str], int]] = set()
+    for value in values:
+        if not value:
+            continue
+        for repository, number in _ISSUE_REF_RE.findall(str(value)):
+            refs.add((repository.lower() or None, int(number)))
+    return refs
+
+
+def _issue_gate_error(
+    kb, conn, requested_refs: set[tuple[Optional[str], int]], body: Optional[str],
+) -> Optional[str]:
+    try:
+        tasks = kb.list_tasks(conn, status="running")
+        tasks.extend(kb.list_tasks(conn, status="blocked"))
+    except Exception:
+        logger.warning(
+            "kanban_create issue dedup gate could not read the board; "
+            "allowing creation", exc_info=True)
+        return None
+
+    body_text = str(body or "")
+    for task in tasks:
+        task_refs = _issue_refs(task.title, task.body)
+        if not any(
+            requested_number == task_number
+            and (requested_repo is None or task_repo is None
+                 or requested_repo == task_repo)
+            for requested_repo, requested_number in requested_refs
+            for task_repo, task_number in task_refs
+        ):
+            continue
+        boundary = r"(?<![\w-])" + re.escape(task.id) + r"(?![\w-])"
+        if re.search(boundary, body_text):
+            continue
+        return (
+            f"kanban_create rejected: {task.id} is already active for this issue. "
+            f"To make this a merger card instead, include the existing card id "
+            f"{task.id} in body."
+        )
+    return None
 
 
 # --- Goal-mode judge gate ---
@@ -1072,7 +1120,12 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    issue_refs = _issue_refs(title, args.get("body"))
     with _board(args.get("board")) as (kb, conn):
+        if issue_refs and cfg_get(load_config(), "kanban", "dedup_gate", default=True):
+            duplicate_error = _issue_gate_error(kb, conn, issue_refs, args.get("body"))
+            if duplicate_error:
+                return tool_error(duplicate_error)
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
