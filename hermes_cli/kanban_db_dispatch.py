@@ -1571,17 +1571,15 @@ def check_respawn_guard(
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
+        # A provider quota wall is not transient from the dispatcher's point of
+        # view.  Never respawn indefinitely: the previous implementation
+        # retried forever after the cooldown elapsed and could burn thousands of
+        # provider calls without producing work.  Keep the card blocked until a
+        # deliberate operator action creates a new run after quota recovery.
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        if rl_cooldown > 0 and ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return None
+        return "blocker_auth"
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
@@ -2069,7 +2067,7 @@ def _dispatch_lane_task(
         # else happened on the card since (reassign, comment) — not one row per tick forever,
         # and not one row per foreign home per tick on a shared board (#101015).
         if not dry_run:
-            with _kb.write_txn(conn):
+            with _kb.write_txn(conn, allow_nested=True):
                 last = conn.execute(
                     "SELECT kind, payload FROM task_events WHERE task_id = ? "
                     "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
@@ -2095,8 +2093,13 @@ def _dispatch_lane_task(
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+            with _kb.write_txn(conn, allow_nested=True):
+                last = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+                if (last is None or last["kind"] != "respawn_guarded"
+                        or last["payload"] != _kb._json_or_null({"reason": guard_reason})):
+                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
     def _count_spawn(name: str) -> None:

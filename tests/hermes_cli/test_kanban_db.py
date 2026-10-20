@@ -463,10 +463,118 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
         assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
 
-        # Past cooldown → allowed (None), NOT trapped by blocker_auth even
-        # though last_failure_error contains "rate-limited".
+        # Past cooldown → stop retrying with blocker_auth. A later deliberate
+        # run supersedes the rate-limit run and releases the guard.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'succeeded', 'succeeded', ?, ?)",
+            (tid, now + 500, now + 600),
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=NULL WHERE id=?", (tid,),
+        )
+        conn.commit()
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 700)
         assert kbd.check_respawn_guard(conn, tid) is None
+
+
+
+
+def test_respawn_guard_dry_run_writes_no_event(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
+    now = 5_000_000
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="guarded-dry", assignee="quality")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error='403 forbidden' WHERE id=?", (tid,),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        result = kbd.DispatchResult()
+        assert kbd._dispatch_lane_task(
+            conn, row, "quality", result, lane="ready", dry_run=True,
+            ttl_seconds=None, board=None, failure_limit=2, spawn_fn=None,
+            per_profile_cap=None, per_profile_running={},
+        ) is False
+        assert result.respawn_guarded == [(tid, "blocker_auth")]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='respawn_guarded'",
+            (tid,),
+        ).fetchone()[0] == 0
+
+
+def test_respawn_guarded_event_is_write_once(kanban_home, monkeypatch):
+    """One dispatcher tick persists one identical guard diagnostic."""
+    import hermes_cli.profiles as profile_module
+    import hermes_cli.config as config_module
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(profile_module, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        config_module, "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": False}},
+    )
+
+    now = 5_000_000
+    with kbc.connect() as conn:
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        tid = kb.create_task(conn, title="guarded-once", assignee="quality")
+        run_id = kb.claim_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?", (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued", tid),
+        )
+        conn.commit()
+
+        def guarded_tick():
+            monkeypatch.setattr(kb.time, "time", lambda: tick_at)
+            return kbd.dispatch_once(
+                conn, spawn_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("guarded task must not spawn")
+                ),
+            )
+
+        tick_at = now + 100
+        result = guarded_tick()
+        assert result.respawn_guarded == [(tid, "rate_limit_cooldown")]
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert (last["kind"], last["payload"]) == (
+            "respawn_guarded", kb._json_or_null({"reason": "rate_limit_cooldown"}),
+        )
+        assert guarded_tick().respawn_guarded == [(tid, "rate_limit_cooldown")]
+        assert guarded_tick().respawn_guarded == [(tid, "rate_limit_cooldown")]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='respawn_guarded'",
+            (tid,),
+        ).fetchone()[0] == 1
+
+        tick_at = now + 400
+        assert guarded_tick().respawn_guarded == [(tid, "blocker_auth")]
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert (last["kind"], last["payload"]) == (
+            "respawn_guarded", kb._json_or_null({"reason": "blocker_auth"}),
+        )
+        assert guarded_tick().respawn_guarded == [(tid, "blocker_auth")]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='respawn_guarded'",
+            (tid,),
+        ).fetchone()[0] == 2
 
 
 @pytest.mark.parametrize(
