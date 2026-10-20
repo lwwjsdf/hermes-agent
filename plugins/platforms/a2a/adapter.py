@@ -225,6 +225,13 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
         identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
         if identity is None:
+            # Q-0126 闸门③ (t_702894bd): every 401 must land in the auth-reject audit
+            # trail and the metrics counters — a forced-bearer rollout that leaves this
+            # path dark turns a fleet-wide credential mismatch into a silent outage.
+            security.audit_auth_reject(
+                "401", adapter.port, self.path, self._client_ip(),
+                self.headers.get("Authorization"))
+            protocol.metrics.unauthorized_total += 1
             return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -254,6 +261,13 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             if failed():
                 if code == protocol.ERR_RATE_LIMITED:
                     protocol.metrics.rate_limit_triggers += 1
+                elif code == protocol.ERR_UNTRUSTED_PEER:
+                    # Q-0126 闸门③ (t_702894bd): an allow-list change can lock out a
+                    # previously-working peer with 403s — same alert surface as 401.
+                    security.audit_auth_reject(
+                        "403", adapter.port, self.path, self._client_ip(),
+                        self.headers.get("Authorization"))
+                    protocol.metrics.untrusted_peer_total += 1
                 return self._error(http, req_id, code, msg)
         agent = route["agent"]
         if handler_name == "_rpc_message_send":

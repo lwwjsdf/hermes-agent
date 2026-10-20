@@ -217,3 +217,42 @@ def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         logger.debug("A2A: audit write failed", exc_info=True)
+
+
+def _token_fingerprint(auth_header: Optional[str]) -> str:
+    """Short SHA-256 fingerprint of the presented bearer credential for the audit
+    trail — never the credential itself. Empty/absent => "none"."""
+    if not auth_header:
+        return "none"
+    parts = auth_header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        return "malformed"
+    return "fp:" + hashlib.sha256(parts[1].strip().encode("utf-8")).hexdigest()[:12]
+
+
+def audit_auth_reject(status: str, port: int, path: str, client_ip: str,
+                      auth_header: Optional[str]) -> None:
+    """Append an auth-reject record (401 wrong/missing bearer, 403 untrusted peer) to
+    ``~/.hermes/audit/a2a_auth_rejects.jsonl`` — Q-0126 闸门③ (t_702894bd).
+
+    The 10-18 forced-bearer rollout left this path dark for 16h+ because HTTP 401 was
+    neither logged nor audited; this is the server-side retrieval surface. ``port``
+    distinguishes the 9901 default endpoint from secondary-profile binds (9909 etc.).
+    The header itself is only ever recorded as a fingerprint — never the token. Never raises.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        audit_dir = get_hermes_home() / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": time.time(),
+            "status": str(status),
+            "port": int(port) if port else None,
+            "path": (path or "/")[:200],
+            "client_ip": client_ip or "",
+            "token": _token_fingerprint(auth_header),
+        }
+        with (audit_dir / "a2a_auth_rejects.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("A2A: auth-reject audit write failed", exc_info=True)

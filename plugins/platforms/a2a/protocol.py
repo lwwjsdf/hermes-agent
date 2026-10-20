@@ -267,7 +267,11 @@ class Metrics:
     and outbound tools; not persisted)."""
 
     _COUNTERS = ("inbound_total", "outbound_total", "streams_started", "push_sent", "push_failed",
-                 "tasks_completed", "tasks_failed", "anti_loop_triggers", "rate_limit_triggers")
+                 "tasks_completed", "tasks_failed", "anti_loop_triggers", "rate_limit_triggers",
+                 "unauthorized_total", "untrusted_peer_total")
+    # Declared for type-checkers; instantiated from _COUNTERS in __init__.
+    unauthorized_total: int
+    untrusted_peer_total: int
 
     def __init__(self) -> None:
         for name in self._COUNTERS:
