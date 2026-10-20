@@ -28,7 +28,7 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
-from . import protocol, security
+from . import dedup, protocol, security
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,15 @@ def _reply_timeout() -> float:
         return max(1.0, float(os.getenv("A2A_REPLY_TIMEOUT", "300")))
     except (ValueError, TypeError):
         return 300.0
+
+
+def _dedup_window(extra: dict) -> float:
+    """Inbound retry window in seconds (default: 30 minutes)."""
+    raw = _get_scoped_secret("A2A_DEDUP_WINDOW_SECONDS") or extra.get("dedup_window_seconds", 1800)
+    try:
+        return max(0.0, float(raw))
+    except (ValueError, TypeError):
+        return 1800.0
 
 
 def _orphan_timeout() -> float:
@@ -287,6 +296,8 @@ class A2AAdapter(BasePlatformAdapter):
         self._watchdog_stop = threading.Event()
         # Per-adapter protocol state (not module-global).
         self.tasks, self._turns, self._rate_limiter = protocol.TaskStore(), protocol.TurnTracker(), protocol.RateLimiter()
+        from hermes_constants import get_hermes_home
+        self._dedup = dedup.DedupLedger(get_hermes_home() / "a2a_dedup.jsonl", _dedup_window(extra))
         # Forwarded profile sessions: (profile, agent_slug, context_id) -> session_id.
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
         self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
@@ -526,6 +537,7 @@ class A2AAdapter(BasePlatformAdapter):
     def _end_task(self, rec: dict, state: str, text: str, stored_reply: str = "") -> tuple[dict, None]:
         """Complete a task immediately (rejected / not ready) and build its terminal Task."""
         self.tasks.complete(rec["task_id"], state, stored_reply)
+        self._dedup.update(rec["task_id"], state, stored_reply or text)
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
@@ -534,11 +546,26 @@ class A2AAdapter(BasePlatformAdapter):
         (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
-        context_id = protocol.extract_context_id(params) or protocol.new_context_id()
+        inbound_context_id = protocol.extract_context_id(params)
+        context_id = inbound_context_id or protocol.new_context_id()
         task_id = protocol.new_task_id()
+        message = params.get("message") if isinstance(params.get("message"), dict) else {}
+        duplicate, rec = self._dedup.claim(
+            peer, message, context_id, inbound_context_id, task_id,
+            lambda: self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent)),
+        )
+        if duplicate is not None:
+            original_id = str(duplicate["first_task_id"])
+            live = self.tasks.get(original_id, *self._scope_for_agent(agent))
+            state = str((live or duplicate).get("state") or protocol.STATE_SUBMITTED)
+            reply = str((live or duplicate).get("reply") or "Task already accepted; use the original task id for status.")
+            receipt = f"{dedup.DUPLICATE_PREFIX} {reply}"
+            message_id = str(message.get("messageId") or "")
+            security.audit("inbound_dedup", peer, original_id,
+                           f"hit messageId={message_id or '<content-hash>'} replay→{original_id}")
+            return protocol.build_task(original_id, str(duplicate["contextId"]), state, receipt), None
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         if turn > max_turns:
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
@@ -626,6 +653,7 @@ class A2AAdapter(BasePlatformAdapter):
         else:
             m.tasks_failed += 1
         self.tasks.complete(task_id, state, reply)
+        self._dedup.update(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
